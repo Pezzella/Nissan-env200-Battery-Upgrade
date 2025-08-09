@@ -22,6 +22,20 @@ Once on your machine, double click the "can-bridge-env200.cproj" and it opens wi
 ## Making changes to the software
 All changes are made in the "can-bridge-env200.c" file. Manipulations to messages happen after the **switch(frame.can_id){ ** line. Generated messages to be sent are handled in the **ISR(TCC0_OVF_vect){** interrupt. Happy programming!
 
+## Calibrating the extender pack capacity
+The firmware assumes the extender pack can deliver **450 GIDs** (about 36 kWh).
+This value is stored in the `extender_full_gids` variable and can be overridden at build time
+by defining `EXTENDER_FULL_GIDS_OVERRIDE` to the measured full‑charge GID count:
+
+```
+#define EXTENDER_FULL_GIDS_OVERRIDE 420
+```
+
+All SOC and quick‑charge scaling calculations use this setting, so adjust it to match your pack’s real capacity.
+
+## Serial measurement output
+When built with `USB_SERIAL` and `ENABLE_CAN3`, the firmware polls the BMS and current sensor every 10 ms and prints pack voltage, current and extender GIDs over the USB serial port for debugging.
+
 ## Flashing the 3-port CAN-bridge
 If you want to simply flash a pre-made .hex file, follow this video: https://youtu.be/eLcNSo2Vn6U?t=170
 A pre-made .hex file is found in the debug folder of this repository.
