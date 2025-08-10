@@ -43,17 +43,22 @@ void canframe_to_str(char * str, can_frame_t frame){
 }
 
 void int_to_hex(char * str, int num){
-	uint8_t tmp;
-	tmp = (num & 0xF0) >> 4;
-	if(tmp > 9){ *str++ = 55 + tmp; } else { *str++ = 48 + tmp; }
-	tmp = num & 0xF;
-	if(tmp > 9){ *str++ = 55 + tmp; } else { *str++ = 48 + tmp; }
+        uint8_t tmp;
+        tmp = (num & 0xF0) >> 4;
+        if(tmp > 9){ *str++ = 55 + tmp; } else { *str++ = 48 + tmp; }
+        tmp = num & 0xF;
+        if(tmp > 9){ *str++ = 55 + tmp; } else { *str++ = 48 + tmp; }
+}
+
+char hex_to_ascii(uint8_t nibble){
+        if(nibble < 10) return '0' + nibble;
+        return 'A' + nibble - 10;
 }
 
 //recalculates the CRC-8 with 0x85 poly
 void calc_crc8(can_frame_t *frame){
-	uint8_t crc = 0;
-	for(uint8_t i = 0; i < 7; i++){
+        uint8_t crc = 0;
+        for(uint8_t i = 0; i < 7; i++){
 		crc = crctable[(crc ^ ((int) (*frame).data[i])) % 256];
 	}
 	(*frame).data[7] = crc;

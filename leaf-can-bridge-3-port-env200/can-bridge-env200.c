@@ -5,6 +5,7 @@ DALA CAN Bridge rev. 2.5
 */
 
 #include "can-bridge-env200.h"
+#include "helper_functions.h"
 
 /* Optional functionality */
 #define USB_SERIAL
@@ -23,7 +24,7 @@ uint8_t	output_can_to_serial = 1;	//specifies if the received CAN messages shoul
 #define CSM_ERR_NO_DATA 0x49
 #define CSM_ERR_DAC_DEFAULT 0x4A
 #define CSM_ERR_REF_DEFAULT 0x4B
-#define EXTENDER_FULL_GIDS_DEFAULT 450      //36 kWh extender pack at 80 Wh per GID
+#define EXTENDER_FULL_GIDS_DEFAULT 375      //30 kWh extender pack at 80 Wh per GID
 
 
 //General variables
@@ -33,9 +34,8 @@ uint16_t        extender_full_gids            = EXTENDER_FULL_GIDS_OVERRIDE;
 uint16_t        extender_full_gids            = EXTENDER_FULL_GIDS_DEFAULT;
 #endif
 volatile	uint16_t	main_battery_soc        = 0;
-volatile        uint16_t        total_battery_soc       = 0; 
 volatile        uint16_t        GIDS                            = 0;    //total GIDs (main + extender)
-volatile        uint16_t        main_pack_gids          = 0; 
+volatile        uint16_t        main_pack_gids          = 0;
 volatile	uint8_t		can_busy			= 0;	//Tracks whether the can_handler() subroutine is running
 volatile	uint16_t	sec_timer			= 1;	//Counts down from 1000
 //Battery measurement variables
@@ -46,7 +46,11 @@ volatile        uint8_t         csm_error                      = 0;
 //Energy tracking
 volatile        int64_t         extender_energy_mWh           = 0;
 volatile        int32_t         Extender_gids                 = 0;
-volatile        uint16_t        extender_soc                  = 0;
+volatile        uint16_t        gid_overflow                  = 0;
+volatile        uint8_t         soc_request_pending          = 0;
+volatile        uint8_t         quick_charge_active          = 0;
+volatile        uint16_t        quick_charge_timer           = 0;
+volatile        uint8_t         slow_charge_active           = 0;
 
 //CAN message templates
 volatile	uint8_t		battery_can_bus			= 2; //keeps track on which CAN bus the battery talks
@@ -278,39 +282,47 @@ void print_measurements(void){
 static void print_csm_error(uint8_t err){
     if(!output_can_to_serial || err == 0) return;
     char msg[] = "CSM ERR 0x00\n";
-    msg[8] = hex_to_ascii((err >> 4) & 0xF);
-    msg[9] = hex_to_ascii(err & 0xF);
+    int_to_hex(msg + 8, err);
     print(msg, 11);
 }
 #endif
 #endif
 
-static void update_total_soc(void){
+static void update_gids(void){
+    uint16_t raw = main_pack_gids + Extender_gids;
+    if (raw > 500) {
+        gid_overflow += raw - 500;
+        GIDS = 500;
+    } else if (gid_overflow && raw < 500) {
+        uint16_t needed = 500 - raw;
+        if (gid_overflow > needed) {
+            gid_overflow -= needed;
+            GIDS = 500;
+        } else {
+            GIDS = raw + gid_overflow;
+            gid_overflow = 0;
+        }
+    } else {
+        GIDS = raw;
+    }
+}
+
+static void update_qc_capacity(can_frame_t *frame){
     uint16_t main_full_gids = main_battery_soc ? ((uint32_t)main_pack_gids * 100) / main_battery_soc : main_pack_gids;
     uint16_t total_full_gids = main_full_gids + extender_full_gids;
-    total_battery_soc = total_full_gids ? ((uint32_t)GIDS * 100) / total_full_gids : 0;
+    uint32_t qc_capacity_wh = total_full_gids ? ((uint32_t)23000 * GIDS) / total_full_gids : 0;
+    if(qc_capacity_wh > 49999) qc_capacity_wh = 49999;
+    frame->data[2] = (qc_capacity_wh >> 16) & 0xFF;
+    frame->data[3] = (qc_capacity_wh >> 8) & 0xFF;
+    frame->data[4] = qc_capacity_wh & 0xFF;
 }
 
 static void coulomb_tick(void){
     coulomb_count_mAs += (int64_t)pack_current_mA * 10;
     extender_energy_mWh += ((int64_t)pack_current_mA * pack_voltage_mV * 10) / 3600000000LL;
     Extender_gids = extender_energy_mWh / 80000;
-    GIDS = main_pack_gids + Extender_gids;
-    extender_soc = extender_full_gids ? (Extender_gids * 100) / extender_full_gids : 0;
-    update_total_soc();
+    update_gids();
     send_can(battery_can_bus, bms_request388);
-}
-
-static void update_qc_capacity(can_frame_t *frame){
-    uint16_t main_full_gids = main_battery_soc ? ((uint32_t)main_pack_gids * 100) / main_battery_soc : main_pack_gids;
-    uint16_t total_full_gids = main_full_gids + extender_full_gids;
-    uint16_t temp = ((uint32_t)230 * GIDS) / total_full_gids;
-    frame->data[3] = (frame->data[3] & 0xF0) | ((temp >> 5) & 0xF);
-    frame->data[4] = ((temp & 0x1F) << 3) | (frame->data[4] & 0x07);
-    calc_crc8(frame);
-}
-
-
 
 //fires every 1ms
 ISR(TCC0_OVF_vect){
@@ -365,14 +377,21 @@ ISR(PORTC_INT0_vect){
 
 //CAN handler, manages reading data from received CAN messages 
 void can_handler(uint8_t can_bus){
-	can_frame_t frame;
-	uint16_t temp; //Temporary variable
-	
-	char strbuf[] = "1|   |                \n";
-	if(can_bus == 2){ strbuf[0] = 50; }
-	if(can_bus == 3){ strbuf[0] = 51; }
-	
-	uint8_t flag = can_read(MCP_REG_CANINTF, can_bus);
+        can_frame_t frame;
+        uint16_t temp; //Temporary variable
+
+        char strbuf[] = "1|   |                \n";
+        if(can_bus == 2){ strbuf[0] = 50; }
+        if(can_bus == 3){ strbuf[0] = 51; }
+
+        if(quick_charge_timer){
+                quick_charge_timer--;
+                if(quick_charge_timer == 0){
+                        quick_charge_active = 0;
+                }
+        }
+
+        uint8_t flag = can_read(MCP_REG_CANINTF, can_bus);
 		
 	if (flag & (MCP_RX0IF | MCP_RX1IF)){
 
@@ -384,8 +403,22 @@ void can_handler(uint8_t can_bus){
 			can_bit_modify(MCP_REG_CANINTF, MCP_RX0IF, 0x00, can_bus);
 		}
 		
-		switch(frame.can_id){
-                       case 0x1F2:
+               switch(frame.can_id){
+                       case 0x1DB:{
+                               if(slow_charge_active) break;
+                               uint8_t raw_soc = frame.data[4] & 0x7F;
+                               main_battery_soc = raw_soc;
+                               if(quick_charge_active && raw_soc <= 90){
+                                       uint32_t main_full_gids = main_battery_soc ? ((uint32_t)main_pack_gids * 100) / main_battery_soc : main_pack_gids;
+                                       uint32_t total_full_gids = main_full_gids + extender_full_gids;
+                                       uint16_t total_soc = total_full_gids ? ((uint32_t)GIDS * 100) / total_full_gids : main_battery_soc;
+                                       if(total_soc <= 90){
+                                               frame.data[4] = (frame.data[4] & 0x80) | (total_soc & 0x7F);
+                                               calc_crc8(&frame);
+                                       }
+                               }
+                       break;}
+                      case 0x1F2:
                                 //Upon reading VCM originating 0x1F2 every 10ms, send the missing message to battery every 40ms
                                 ticks10ms++;
                                 if(ticks10ms > 3)
@@ -395,10 +428,53 @@ void can_handler(uint8_t can_bus){
                                 }
 
                        break;
-                       case 0x55B:
+                       case 0x79B:
+                               if(slow_charge_active) break;
+                               if(frame.data[0] == 0x02 && frame.data[1] == 0x21 && frame.data[2] == 0x01){
+                                       soc_request_pending = 1;
+                               } else {
+                                       soc_request_pending = 0;
+                               }
+                       break;
+                       case 0x7BB:
+                               if(slow_charge_active) break;
+                               if(soc_request_pending){
+                                       if(frame.data[0] == 0x10){
+                                               if(!(frame.data[2] == 0x61 && frame.data[3] == 0x01)){
+                                                       soc_request_pending = 0;
+                                               }
+                                       } else if(frame.data[0] == 0x24 || frame.data[0] == 0x25){
+                                               uint32_t main_full_gids = main_battery_soc ? ((uint32_t)main_pack_gids * 100) / main_battery_soc : main_pack_gids;
+                                               uint32_t total_full_gids = main_full_gids + extender_full_gids;
+                                               uint32_t soc = total_full_gids ? ((uint32_t)GIDS * 1000000) / total_full_gids : (uint32_t)main_battery_soc * 10000;
+                                               if(frame.data[0] == 0x24){
+                                                       frame.data[7] = (soc >> 16) & 0xFF;
+                                               } else {
+                                                       frame.data[1] = (soc >> 8) & 0xFF;
+                                                       frame.data[2] = soc & 0xFF;
+                                                       soc_request_pending = 0;
+                                               }
+                                       }
+                               }
+                       break;
+                       case 0x55B:{
+                               if(slow_charge_active) break;
+
+                               uint16_t main_full_gids;
+                               uint16_t total_full_gids;
+                               uint16_t total_soc;
+                               uint16_t raw_soc;
+
                                main_battery_soc = (frame.data[0] << 2) | ((frame.data[1] & 0xC0) >> 6); //Capture SOC% needed for QC_rescaling
                                main_battery_soc /= 10; //Remove decimals, 0-100 instead of 0-100.0
-                               update_total_soc();
+
+                               main_full_gids = main_battery_soc ? ((uint32_t)main_pack_gids * 100) / main_battery_soc : main_pack_gids;
+                               total_full_gids = main_full_gids + extender_full_gids;
+                               total_soc = total_full_gids ? ((uint32_t)GIDS * 100) / total_full_gids : main_battery_soc;
+                               if(total_soc > 100) total_soc = 100;
+                               raw_soc = total_soc * 10;
+                               frame.data[0] = raw_soc >> 2;
+                               frame.data[1] = (frame.data[1] & 0x3F) | ((raw_soc & 0x3) << 6);
 
                                 battery_can_bus = can_bus; //Check on what side of the CAN-bridge the battery is connected to
 
@@ -406,27 +482,36 @@ void can_handler(uint8_t can_bus){
                                 send_can(battery_can_bus, instrumentCluster5E3);
                                 send_can(battery_can_bus, ZE1message5C5);
 
-                        break;
-			case 0x5BC:
-                                if((frame.data[5] & 0x10) == 0x00)
-                                { //LB_MAXGIDS is 0, capture pack GIDs
-                                        main_pack_gids = ((frame.data[0] << 2) | ((frame.data[1] & 0xC0) >> 6));
-                                }
+                        break;}
+                       case 0x5BC:{
+                               uint8_t charging_state = frame.data[5];
+                               if((frame.data[5] & 0x10) == 0x00)
+                               { //LB_MAXGIDS is 0, capture pack GIDs
+                                       main_pack_gids = ((frame.data[0] << 2) | ((frame.data[1] & 0xC0) >> 6));
+                               }
 
-                               GIDS = main_pack_gids + Extender_gids; //report combined GID count
-                               update_total_soc();
+                               update_gids(); //report combined GID count with overflow handling
 
-                                //Avoid blinking GOM by always writing remaining GIDS
-                                frame.data[0] = GIDS >> 2;
-                                frame.data[1] = (GIDS << 6) & 0xC0;
-                                frame.data[5] &= 0x03; //Clear LB_Output_Power_Limit_Reason and LB_MaxGIDS
-			break;
-                       case 0x59E:   // QC capacity message
-                                update_qc_capacity(&frame);
-                        break;
-                        case ID_BMS_STATUS:
-                                pack_voltage_mV = 0;
-                        break;
+                               if(charging_state != 0x20){
+                                       slow_charge_active = 1;
+                                       break;
+                               }
+                               slow_charge_active = 0;
+
+                               //Avoid blinking GOM by always writing remaining GIDS
+                               frame.data[0] = GIDS >> 2;
+                               frame.data[1] = (GIDS << 6) & 0xC0;
+                               frame.data[5] &= 0x03; //Clear LB_Output_Power_Limit_Reason and LB_MaxGIDS
+                       break;}
+                   case 0x59E:
+                               if(slow_charge_active) break;
+                               update_qc_capacity(&frame);
+                               quick_charge_active = 1;
+                               quick_charge_timer = 1000;
+                    break;
+                       case ID_BMS_STATUS:
+                               pack_voltage_mV = 0;
+                       break;
                         case ID_BMS_VOLTAGE:
                                 temp = (frame.data[2] << 8) | frame.data[3];
                                 pack_voltage_mV += ((uint32_t)temp * 5000) / 65535;
